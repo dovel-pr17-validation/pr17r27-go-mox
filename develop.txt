@@ -1,0 +1,444 @@
+This file has notes useful for contributors.
+
+# Building & testing
+
+For a full build, you'll need a recent Go compiler/toolchain and nodejs/npm for
+the frontend. Run "make build" to do a full build. Run "make test" to run the
+test suite. With docker installed, you can run "make test-integration" to start
+up a few mox instances, a dns server, a postfix instance, and send email
+between them.
+
+The mox localserve command is a convenient way to test locally. Most of the
+code paths are reachable/testable with mox localserve, but some use cases will
+require a full setup.
+
+Before committing, run at least "make fmt" and "make check" (which requires
+staticcheck and ineffassign, run "make install-staticcheck install-ineffassign"
+once). Also run "make check-shadow" and fix any shadowed variables other than
+"err" (which are filtered out, but causes the command to always exit with an
+error code; run "make install-shadow" once to install the shadow command). If
+you've updated RFC references, run "make" in rfc/, it verifies the referenced
+files exist.
+
+When making changes to the public API of a package listed in
+apidiff/packages.txt, run "make genapidiff" to update the list of changes in
+the upcoming release (run "make install-apidiff" once to install the apidiff
+command).
+
+New features may be worth mentioning on the website, see website/ and
+instructions below.
+
+
+# Code style, guidelines, notes
+
+- Keep the same style as existing code.
+- For Windows: use package "path/filepath" when dealing with files/directories.
+  Test code can pass forward-slashed paths directly to standard library functions,
+  but use proper filepath functions when parameters are passed and in non-test
+  code.  Mailbox names always use forward slash, so use package "path" for mailbox
+  name/path manipulation. Do not remove/rename files that are still open.
+- Use github.com/mjl-/adns for DNS where possible, it returns whether DNS
+  results are DNSSEC-verified. Keep in mind that some code paths don't use "adns",
+  e.g. HTTP requests (which go through the standard library, and we can't replace
+  the DNS library from the standard library, and we couldn't get the
+  DNSSEC-verification status from the "http" package anyway.
+- We don't have an internal/ directory, really just to prevent long paths in
+  the repo, and to keep all Go code matching *.go */*.go (without matching
+  vendor/). Part of the packages are reusable by other software. Those reusable
+  packages must not cause mox implementation details (such as bstore) to get out,
+  which would cause unexpected dependencies. Those packages also only expose the
+  standard slog package for logging, not our mlog package. Packages not intended
+  for reuse do use mlog as it is more convenient. Internally, we always use
+  mlog.Log to do the logging, wrapping an slog.Logger.
+- The code uses panic for error handling in quite a few places, including
+  smtpserver, imapserver and web API calls. Functions/methods, variables, struct
+  fields and types that begin with an "x" indicate they can panic on errors. Both
+  for i/o errors that are fatal for a connection, and also often for user-induced
+  errors, for example bad IMAP commands or invalid web API requests. These panics
+  are caught again at the top of a command or top of the connection. In general,
+  write code that is panic-safe, using defer to clean up and release resources.
+- Try to check all errors, at the minimum using mlog.Log.Check() to log an error
+  at the appropriate level. Also when just closing a file. Log messages sometimes
+  unexpectedly point out latent issues. Only when there is no point in logging,
+  for example when previous writes to stderr failed, can error logging be skipped.
+  Test code is less strict about checking errors.
+- See the Makefile for commonly used command invocations, e.g. for tests,
+  various checks, formatting.
+- Keep the number of dependencies limited. Certainly protocol (especially
+  email) handling code should not be in an external dependency. By maintaining
+  that code ourselves, it's easier to ensure we don't introduce unexpected
+  changes in behaviour, and it allows us to thoroughly document our code against
+  the RFCs.
+- Mox can be compiled deterministically with the "go install" command (with
+  "CGO_ENABLED=0 go install -trimpath"). The frontend code is written in
+  typescript. To get working binaries after "go install", the generated/compiled
+  javascript code is also committed in the repository. The frontend machinations
+  should be kept simple, with a straightforward translation from typescript files
+  to javascript.
+- Write tests for high-level functional scenario's at a minimum, especially for
+  protocols. For server code, write the implementation so a server can be
+  started and driven from tests. This is relatively easy because of the bstore
+  database library used: All state is written to a simple single-file database
+  file that can easily be removed between test runs. Also write a client. That
+  will deepen your understanding of the protocol, and makes it easier to find
+  corner cases to test for. Keep long-term maintainability into account. Of both
+  this implementations, and the wider protocol/ecosystem.
+- Protocol/standards-related code is heavily cross-referenced with RFCs, by
+  placing comments such as "Command: ../rfc/9051:4330 ../rfc/3501:2992
+  ../rfc/7162:864" in the code. These reference line numbers in multiple RFCs.
+  Your editor/IDE may support opening them by clicking on them. Because these
+  references are on a single line, we consider them related. In this case, it's a
+  single command with references to its description in multiple versions of IMAP.
+  Run "make" in ./rfc to download RFCs and adding references back to the code.
+  See https://www.xmox.nl/xr/dev/ for an online version of cross-referenced RFCs
+  and code. The RFCs also point back to the code where the RFC-references have
+  been turned into links back to RFCs. It's easy to navigate between code and
+  (historic) versions of RFCs. Ideally, you can read the RFC for a
+  protocol/format, and see that all requirements/behaviour are implemented, and
+  where the code is that handles it. If annotations start with "// todo", "//
+  todo <word>:", the RFCs are annotated with "todo" or "todo <word>" to indicate
+  that functionality/behaviour may not be fully implemented.
+- When creating a PR, it helps to explain your considerations, including which
+  choices you face and how you came to decisions. Ensure you update all
+  relevant facets of the change. For example, when adding support for a new
+  IMAP-related feature, you may also have to add similar functionality to the
+  webmail interface.
+- Write documentation so packages stay readable at
+  https://pkg.go.dev/github.com/mjl-/mox.
+- Keep mechanisms as simple, standalone and with as few machinations as
+  possible. Automate where possible. Don't add dependencies on external services.
+  This helps long-term maintainability. For example, the "help" output of commands
+  are generated when building and included as documentation, so we can use
+  pkg.go.dev for documentation. The mox website also contains a generated copy of
+  the help output. We don't have to sync it manually, or remember to update it in
+  multiple places.
+
+
+# Storage
+
+Email messages are stored in files. Each message is in its own file. We don't
+use the mbox format (too much rewriting of data) or maildir format (better than
+mbox, but too limited for efficient handling of modern server requirements). We
+explicitly don't want other applications touching files in the directory that
+holds an accounts messages. Users should use standard protocols (e.g. IMAP) or
+the web interface to access email messages. Storage is per user account (that
+can have multiple addresses). All email message files are kept in a per-account
+directory, with subdirectories so they are grouped in sets of 8k (for
+reasonable directory listing performance). The email message file only contains
+the message data. Headers added by the SMTP server are not in this message
+file, but in the message index database file.
+
+Each account has a bstore database file with an index of the database messages.
+The email message files are named after IDs of records of the "Message" table
+in the database. The Message table also has all other metadata information
+about a message. Such as which mailbox it belongs to, and message flags (e.g.
+"seen" (also known as "read"), "junk", "non-junk"), various IMAP and
+synchronisation-related metadata (e.g. IMAP's UID, MODSEQ), and
+reputation-related information used for spam classification (e.g. the verified
+DKIM/SPF domains of the message, the originating IP address).
+
+Bstore database files are built on bbolt database files (like LMDB but in Go;
+transactional multi-bucket key/value b+trees in a single file, accessed by an
+in-process library (like sqlite) instead of a separate application (like
+PostgreSQL)). Bstore adds higher-level functionality:
+referential/unique/nonzero constraints, (multikey) indices, automatic schema
+management based on Go types and struct tags, and a query API. Bstore has no
+higher-level concepts such as joins (but those aren't typically needed) or a
+query language (the query API and getting/updating/deleting individual records
+by primary key are enough).
+
+Bbolt has known limitations. One relevant limitation is that writes are kept in
+memory until the end of the transaction. For large transactions where lots of
+data changes (e.g. when importing lots of messages, or updating all records in
+a large table), you will need to make changes in multiple transactions,
+committing partial work (and possibly adding a mechanism to undo the partial
+work). We want to keep working on machines with little memory too.
+
+See package "store" for details about storage in mox. See
+https://pkg.go.dev/github.com/mjl-/bstore for details about the bstore database
+files/library.
+
+
+# Reusable packages
+
+Most non-server Go packages are meant to be reusable. This means internal
+details are not exposed in the API, and we don't make unneeded changes. We can
+still make breaking changes when it improves mox: We don't want to be stuck
+with bad API. Third party users aren't affected too seriously due to Go's
+minimal version selection. The reusable packages are in apidiff/packages.txt.
+We generate the incompatible changes with each release.
+
+
+# Web interfaces/frontend
+
+The web interface frontends (for webmail/, webadmin/ and webaccount/) are
+written in strict TypeScript. The web API is a simple self-documenting
+HTTP/JSON RPC API mechanism called sherpa,
+https://www.ueber.net/who/mjl/sherpa/. The web API exposes types and functions
+as implemented in Go, using https://github.com/mjl-/sherpa. API definitions in
+JSON form are generated with https://github.com/mjl-/sherpadoc. Those API
+definitions are used to generate TypeScript clients with by
+https://github.com/mjl-/sherpats/.
+
+The JavaScript that is generated from the TypeScript is included in the
+repository. This makes it available for inclusion in the binary, which is
+practical for users, and desirable given Go's reproducible builds. When
+developing, run "make" to also build the frontend code. Run "make
+install-frontend" once to install the TypeScript compiler into ./node_modules/.
+
+There are no other external (runtime or devtime) frontend dependencies. A
+light-weight abstraction over the DOM is provided by ./lib.ts. A bit more
+manual UI state management must be done compared to "frameworks", but it is
+little code, and this allows JavaScript/TypeScript developer to quickly get
+started. UI state is often encapsulated in a JavaScript object with a
+TypeScript interface exposing a "root" HTMLElement that is added to the DOM,
+and functions for accessing/changing the internal state, keeping the UI
+manageable.
+
+
+# Website
+
+The content of the public website at https://www.xmox.nl is in website/, as
+markdown files. The website HTML is generated with "make genwebsite", which
+writes to website/html/ (files not committed).  The FAQ is taken from
+README.md, the protocol support table is generated from rfc/index.txt. The
+website is kept in this repository so a commit can change both the
+implementation and the documentation on the website. Some of the info in
+README.md is duplicated on the website, often more elaborate and possibly with
+a slightly less technical audience.  The website should also mostly be readable
+through the markdown in the git repo.
+
+Large files (images/videos) are in https://github.com/mjl-/mox-website-files to
+keep the repository reasonably sized.
+
+The public website may serve the content from the "website" branch. After a
+release, the main branch (with latest development code and corresponding
+changes to the website about new features) is merged into the website branch.
+Commits to the website branch (e.g. for a news item, or any other change
+unrelated to a new release) is merged back into the main branch.
+
+
+# TLS certificates
+
+https://github.com/cloudflare/cfssl is useful for testing with TLS
+certificates. Create a CA and configure it in mox.conf TLS.CA.CertFiles, and
+sign host certificates and configure them in the listeners TLS.KeyCerts.
+
+Setup a local CA with cfssl, run once:
+
+```sh
+go install github.com/cloudflare/cfssl/cmd/cfssl@latest
+go install github.com/cloudflare/cfssl/cmd/cfssljson@latest
+
+mkdir -p local/cfssl
+cd local/cfssl
+
+cfssl print-defaults config > ca-config.json # defaults are fine
+
+# Based on: cfssl print-defaults csr > ca-csr.json
+cat <<EOF >ca-csr.json
+{
+    "CN": "mox ca",
+    "key": {
+        "algo": "ecdsa",
+        "size": 256
+    },
+    "names": [
+        {
+            "C": "NL"
+        }
+    ]
+}
+EOF
+
+cfssl gencert -initca ca-csr.json | cfssljson -bare ca - # Generate ca key and cert.
+
+# Generate wildcard certificates for one or more domains, add localhost for use with pebble, see below.
+domains="moxtest.example localhost"
+for domain in $domains; do
+	cat <<EOF >wildcard.$domain.csr.json
+{
+  "key": {
+    "algo": "ecdsa",
+    "size": 256
+  },
+  "names": [
+  {
+    "O": "mox"
+  }
+  ],
+  "hosts": [
+    "$domain",
+    "*.$domain"
+  ]
+}
+EOF
+	cfssl gencert -ca ca.pem -ca-key ca-key.pem -profile=www wildcard.$domain.csr.json | cfssljson -bare wildcard.$domain
+done
+```
+
+Now configure mox.conf to add the cfssl CA root certificate:
+
+```
+TLS:
+	CA:
+		AdditionalToSystem: true
+		CertFiles:
+			# Assuming local/<env>/config/mox.conf and local/cfssl/.
+			- ../../cfssl/ca.pem
+
+[...]
+
+Listeners:
+	public:
+                TLS:
+			KeyCerts:
+				# Assuming local/<env>/config/mox.conf and local/cfssl/.
+				CertFile: ../../cfssl/wildcard.$domain.pem
+				KeyFile: ../../cfssl/wildcard.$domain-key.pem
+```
+
+
+# ACME
+
+https://github.com/letsencrypt/pebble is useful for testing with ACME. Start a
+pebble instance that uses the localhost TLS cert/key created by cfssl for its
+TLS serving. Pebble generates a new CA certificate for its own use each time it
+is started. Fetch it from https://localhost:15000/roots/0, write it to a file, and
+add it to mox.conf TLS.CA.CertFiles. See below.
+
+Setup pebble, run once:
+
+```sh
+go install github.com/letsencrypt/pebble/cmd/pebble@latest
+
+mkdir -p local/pebble
+cat <<EOF >local/pebble/config.json
+{
+  "pebble": {
+    "listenAddress": "localhost:14000",
+    "managementListenAddress": "localhost:15000",
+    "certificate": "local/cfssl/localhost.pem",
+    "privateKey": "local/cfssl/localhost-key.pem",
+    "httpPort": 80,
+    "tlsPort": 443,
+    "ocspResponderURL": "",
+    "externalAccountBindingRequired": false
+  }
+}
+EOF
+```
+
+Start pebble, this generates a new temporary pebble CA certificate:
+
+```sh
+pebble -config local/pebble/config.json
+```
+
+Write new CA bundle that includes pebble's temporary CA cert:
+
+```sh
+export CURL_CA_BUNDLE=local/ca-bundle.pem # for curl
+export SSL_CERT_FILE=local/ca-bundle.pem # for go apps
+cat /etc/ssl/certs/ca-certificates.crt local/cfssl/ca.pem >local/ca-bundle.pem
+curl https://localhost:15000/roots/0 >local/pebble/ca.pem # fetch temp pebble ca, DO THIS EVERY TIME PEBBLE IS RESTARTED!
+cat /etc/ssl/certs/ca-certificates.crt local/cfssl/ca.pem local/pebble/ca.pem >local/ca-bundle.pem # create new list that includes cfssl ca and temp pebble ca.
+rm -r local/*/data/acme/keycerts/pebble # remove existing pebble-signed certs in acme cert/key cache, they are invalid due to newly generated temp pebble ca.
+```
+
+Edit mox.conf, adding pebble ACME and its ca.pem:
+
+```
+ACME:
+	pebble:
+		DirectoryURL: https://localhost:14000/dir
+		ContactEmail: root@mox.example
+TLS:
+	CA:
+		AdditionalToSystem: true
+		CertFiles:
+			# Assuming local/<env>/config/mox.conf and local/pebble/ca.pem and local/cfssl/ca.pem.
+			- ../../pebble/ca.pem
+			- ../../cfssl/ca.pem
+
+[...]
+
+Listeners:
+	public:
+                TLS:
+                        ACME: pebble
+```
+
+For mail clients and browsers to accept pebble-signed certificates, you must add
+the temporary pebble CA cert to their trusted root CA store each time pebble is
+started (e.g. to your thunderbird/firefox testing profile). Pebble has no option
+to not regenerate its CA certificate, presumably for fear of people using it for
+non-testing purposes. Unfortunately, this also makes it inconvenient to use for
+testing purposes.
+
+
+# Messages for testing
+
+For compatibility and performance testing, it helps to have many messages,
+created a long time ago and recently, by different mail user agents. A helpful
+source is the Linux kernel mailing list. Archives are available as multiple git
+repositories (split due to size) at
+https://lore.kernel.org/lkml/_/text/mirror/.  The git repo's can be converted
+to compressed mbox files (about 800MB each) with:
+
+```
+# 0 is the first epoch (with over half a million messages), 12 is last
+# already-complete epoch at the time of writing (with a quarter million
+# messages). The archives are large, converting will take some time.
+for i in 0 12; do
+        git clone --mirror http://lore.kernel.org/lkml/$i lkml-$i.git
+        (cd lkml-$i.git && time ./tombox.sh | gzip >../lkml-$i.mbox.gz)
+done
+```
+
+With the following "tombox.sh" script:
+
+```
+#!/bin/sh
+pre=''
+for rev in $(git rev-list master | reverse); do
+        printf "$pre"
+        echo "From sender@host  $(date '+%a %b %e %H:%M:%S %Y' -d @$(git show -s --format=%ct $rev))"
+        git show ${rev}:m | sed 's/^>*From />&/'
+        pre='\n'
+done
+```
+
+
+# Release process
+
+- Gather feedback on recent changes.
+- Check if dependencies need updates.
+- Run "make modernize".
+- Update to latest publicsuffix/ list ("make fetch-publicsuffixlist").
+- Check code if there are deprecated features that can be removed.
+- Generate apidiff ("make genapidiff") and check if breaking changes can be prevented. Update moxtools.
+- Update features & roadmap in README.md and website.
+- Write release notes, copy from previous.
+- Build ("make build check buildall") and run tests with previous major Go release, run "make docker-release" to test building images.
+- Run tests ("make test"), including with race detector ("make test-race", also with TZ= for UTC-behaviour and with -count 2 ("make test-more").
+- Run integration ("make test-integration") and upgrade tests ("make test-upgrade").
+- Run fuzzing tests for a while ("make fuzz").
+- Deploy to test environment. Test the update instructions.
+- Test mox localserve on various OSes (linux, bsd, macos, windows).
+- Send and receive email through the major webmail providers, check headers.
+- Send and receive email with imap4/smtp clients.
+- Check DNS check admin page.
+- Check with https://internet.nl.
+- Move apidiff/next.txt to apidiff/<version>.txt, and create empty next.txt.
+- Add release to the Latest release & News sections of website/index.md.
+- Create git tag (note: "#" is comment, not title/header), push code.
+- Build and publish new docker image ("make docker-release").
+- Deploy update to website.
+- Create new release on the github page, so watchers get a notification.
+  Copy/paste it manually from the tag text, and add link to download/compile
+  instructions to prevent confusion about "assets" github links to.
+- Publish new cross-referenced code/rfc to www.xmox.nl/xr/.
+- Update moxtools with latest version.
+- Update implementations support matrix.
+- Publish signed release notes for updates.xmox.nl and update DNS record.
